@@ -1,0 +1,17 @@
+# 가상환경
+.venv/
+venv/
+
+# 파이썬
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# 런타임 산출물 (§9, §10)
+audit.jsonl
+*.log
+
+# 내부 설계 문서 (추적 제외)
+PROJECT.md
