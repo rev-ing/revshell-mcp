@@ -42,6 +42,8 @@ class Listener:
     host: str
     port: int
     server: asyncio.AbstractServer
+    # 앞으로 몇 개까지 받을 것인가. None 이면 무제한 (§4.9).
+    remaining: int | None = 1
 
 
 class SessionManager:
@@ -53,8 +55,15 @@ class SessionManager:
 
     # ---- 리스너 -------------------------------------------------------
 
-    async def listener_start(self, port: int, host: str = "127.0.0.1") -> dict:
-        """바인드 게이트와 멱등성 (§4.1). accept 를 기다리지 않고 즉시 반환한다."""
+    async def listener_start(
+        self, port: int, host: str = "127.0.0.1", accept: int = 1
+    ) -> dict:
+        """바인드 게이트와 수락 쿼터 (§4.1, §4.9). accept 를 기다리지 않고 즉시 반환한다.
+
+        accept 만큼 세션을 받으면 리스너가 스스로 닫힌다(기본 1). 0 이면 무제한.
+        재시도 루프를 도는 임플란트가 붙어 있으면 무제한 리스너는 30초마다 세션을
+        하나씩 쌓아 max_sessions 를 포화시키므로, 기본값을 1 로 둔다.
+        """
         # 인증 없는 셸 핸들러를 전 인터페이스에 여는 것은 아무나 붙을 수 있다는 뜻이다.
         # host 가 자유 인자이므로 기본값이 루프백인 것만으로는 부족하다.
         if host not in LOOPBACK and not self.cfg.allow_any_interface:
@@ -62,20 +71,40 @@ class SessionManager:
                 "error": f"refused: binding to a non-loopback address ({host}) "
                 f"requires restarting the server with --allow-any-interface"
             }
+        if accept < 0:
+            return {"error": "accept must be >= 0 (0 means unlimited)"}
+
         if self.listener is not None:
-            if self.listener.port == port:
-                return self._listener_info()  # 멱등
+            lsn = self.listener
+            if lsn.port == port and lsn.host == host:
+                # 같은 포트+host 재호출은 쿼터를 '누적'한다 — n 번 부르면 n 개를 받는다.
+                # 멱등이 아니므로, 확신이 없어 다시 부르면 한 개를 더 받게 된다.
+                if accept == 0 or lsn.remaining is None:
+                    lsn.remaining = None
+                else:
+                    lsn.remaining += accept
+                return self._listener_info()
+            # host 만 다른 경우도 거부한다. 포트만 비교하면 요청한 주소가 조용히
+            # 무시된 채 쿼터만 오르고, 호출자는 0.0.0.0 에 열렸다고 착각한다.
+            what = "port" if lsn.port != port else "bind address"
             return {
-                "error": f"already listening on :{self.listener.port}; "
-                f"call listener_stop() first to move to another port "
+                "error": f"already listening on {lsn.host}:{lsn.port}; "
+                f"call listener_stop() first to change the {what} "
                 f"(existing sessions are not affected)"
             }
         try:
             server = await asyncio.start_server(self._on_connect, host, port)
         except OSError as e:
             return {"error": f"bind failed on {host}:{port} — {e}"}
-        self.listener = Listener(id=new_id("lsn"), host=host, port=port, server=server)
-        log.info("listening on %s:%d (%s)", host, port, self.listener.id)
+        self.listener = Listener(
+            id=new_id("lsn"), host=host, port=port, server=server,
+            remaining=None if accept == 0 else accept,
+        )
+        log.info(
+            "listening on %s:%d (%s, accept=%s)",
+            host, port, self.listener.id,
+            "unlimited" if accept == 0 else accept,
+        )
         return self._listener_info()
 
     async def listener_stop(self) -> dict:
@@ -116,7 +145,18 @@ class SessionManager:
             "listener_id": self.listener.id,
             "host": self.listener.host,
             "port": self.listener.port,
+            # null 이면 무제한. 0 이 되는 순간 리스너는 이미 닫혀 있다.
+            "accept_remaining": self.listener.remaining,
         }
+
+    def _close_listener_socket(self) -> Listener | None:
+        """리스닝 소켓만 동기적으로 닫는다. §4.7 의 wait_closed 함정 주석 참조."""
+        lsn = self.listener
+        if lsn is None:
+            return None
+        self.listener = None
+        lsn.server.close()
+        return lsn
 
     # ---- 연결 수락 ----------------------------------------------------
 
@@ -124,6 +164,20 @@ class SessionManager:
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
         """콜백에서 절대 오래 붙잡지 말 것. 태스크만 띄우고 즉시 반환한다 (§4.2)."""
+        # 수락 쿼터 (§4.9). asyncio 는 한 번의 이벤트에서 backlog 만큼 연속으로
+        # accept 할 수 있으므로, 리스너를 닫는 것만으로는 초과 수락을 막지 못한다.
+        # 여기서 한 번 더 세는 것이 실제 방어선이다.
+        lsn = self.listener
+        if lsn is not None and lsn.remaining is not None:
+            if lsn.remaining <= 0:
+                writer.close()
+                return
+            lsn.remaining -= 1
+            if lsn.remaining == 0:
+                # 마지막 하나를 받았다. 같은 이벤트 루프 틱 안에서 즉시 닫는다.
+                self._close_listener_socket()
+                log.info("listener %s 수락 쿼터 소진 — 자동 중단", lsn.id)
+
         if len(self.sessions) >= self.cfg.max_sessions:
             if not self._evict_one_dead():
                 writer.close()  # fd 누수 방지
@@ -181,7 +235,12 @@ class SessionManager:
     # ---- 조회 툴 ------------------------------------------------------
 
     def session_list(self) -> dict:
-        return {"sessions": [s.summary() for s in self.sessions.values()]}
+        # 리스너 상태를 조회할 다른 수단이 없으므로 여기 함께 싣는다.
+        # 자동 중단(§4.9)됐는지 확인하려면 이 필드를 봐야 한다.
+        return {
+            "listener": self._listener_info() if self.listener else None,
+            "sessions": [s.summary() for s in self.sessions.values()],
+        }
 
     def get(self, session_id: str) -> Session | None:
         return self.sessions.get(session_id)

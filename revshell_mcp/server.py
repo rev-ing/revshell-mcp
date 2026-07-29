@@ -40,18 +40,30 @@ def build(cfg: Config) -> MCPServer:
     mgr = SessionManager(cfg)
 
     @mcp.tool(annotations=_MUTATING)
-    async def listener_start(port: int, host: str = "127.0.0.1") -> dict:
+    async def listener_start(
+        port: int, host: str = "127.0.0.1", accept: int = 1
+    ) -> dict:
         """Start a reverse shell listener and return immediately, without waiting
         for a connection.
 
-        Poll session_list() to see whether a target has connected. Calling this
-        again with the same port returns the existing listener id (idempotent).
+        Poll session_list() to see whether a target has connected; it also reports
+        the listener state under "listener" (null once the listener has closed).
+
+        By default the listener accepts ONE session and then closes itself. This
+        matters because implants usually retry on a loop: an unlimited listener
+        facing a 30-second retry loop gains a new session every 30 seconds and
+        fills up max_sessions. Set accept=N to take N sessions, or accept=0 for
+        an unlimited listener you intend to close yourself with listener_stop().
+
+        Calling this again with the same port ADDS to the quota — it is not
+        idempotent. Three calls means three sessions will be accepted. Do not
+        call it again "just in case"; check session_list() instead.
 
         Only one listener can exist at a time. To move to a different port, call
         listener_stop() first and then start again — do NOT restart the server,
-        which would destroy every session you already have. Note that one port is
-        enough for many targets: any number of them can call back to the same
-        listener and each becomes its own session.
+        which would destroy every session you already have. One port serves many
+        targets: they all call back to the same listener, each becoming its own
+        session, subject to the accept quota.
 
         Keep the default host (127.0.0.1). Any other address is refused —
         including a specific LAN IP such as 192.168.x.x, not only 0.0.0.0. There
@@ -65,7 +77,7 @@ def build(cfg: Config) -> MCPServer:
         the MCP client spawns it. If a non-loopback bind is refused, say so and
         tell the user to re-register; do not suggest a different address.
         """
-        return await mgr.listener_start(port, host)
+        return await mgr.listener_start(port, host, accept)
 
     @mcp.tool(annotations=_MUTATING)
     async def listener_stop() -> dict:
@@ -87,7 +99,12 @@ def build(cfg: Config) -> MCPServer:
 
     @mcp.tool(annotations=_READ_ONLY)
     async def session_list() -> dict:
-        """Summary of all shell sessions, live and dead.
+        """Listener state plus a summary of all shell sessions, live and dead.
+
+        "listener" is null when no listener is running — either it was never
+        started, it was stopped, or it closed itself after filling its accept
+        quota. accept_remaining tells you how many more sessions it will take
+        (null means unlimited).
 
         end_cursor is the absolute end of the buffer, for judging how far behind
         you are. Do NOT pass end_cursor as session_read's `since` — everything

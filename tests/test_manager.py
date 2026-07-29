@@ -56,7 +56,7 @@ class ManagerTest(unittest.IsolatedAsyncioTestCase):
         return t
 
     async def _one_session(self, mode="pipe") -> Session:
-        await self.mgr.listener_start(self.port)
+        await self.mgr.listener_start(self.port, accept=0)
         await self._target(mode)
         await wait_for(lambda: len(self.mgr.sessions) == 1)
         self.assertEqual(len(self.mgr.sessions), 1)
@@ -86,14 +86,102 @@ class ManagerTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("listener_id", r)
         await mgr.close_all()
 
-    # [3] 같은 포트 재호출은 멱등, 다른 포트는 거부
-    async def test_listener_idempotent_and_single(self):
+    # [3] 같은 포트 재호출은 쿼터를 누적하고, 다른 포트는 거부 (§4.9)
+    async def test_listener_requota_and_single(self):
         a = await self.mgr.listener_start(self.port)
+        self.assertEqual(a["accept_remaining"], 1)
         b = await self.mgr.listener_start(self.port)
-        self.assertEqual(a["listener_id"], b["listener_id"])
+        self.assertEqual(a["listener_id"], b["listener_id"])  # 리스너는 하나
+        self.assertEqual(b["accept_remaining"], 2)  # 멱등이 아니라 누적이다
         c = await self.mgr.listener_start(free_port())
         self.assertIn("error", c)
         self.assertIn(str(self.port), c["error"])
+
+    # ---- 수락 쿼터 (§4.9) --------------------------------------------
+
+    async def _connect_n(self, n, gap=0.2):
+        """타겟 n 개를 순차 접속시킨다. 닫힌 뒤의 시도는 조용히 무시한다."""
+        for _ in range(n):
+            try:
+                await self._target()
+            except OSError:
+                pass
+            await asyncio.sleep(gap)
+        await asyncio.sleep(0.3)
+
+    def _live(self):
+        return [s for s in self.mgr.sessions.values() if s.state == "active"]
+
+    # 기본값은 1회 수락 후 자동 중단
+    async def test_accept_one_by_default(self):
+        r = await self.mgr.listener_start(self.port)
+        self.assertEqual(r["accept_remaining"], 1)
+        await self._connect_n(3)
+        self.assertEqual(len(self._live()), 1)
+        self.assertIsNone(self.mgr.listener, "쿼터 소진 후 리스너가 안 닫혔다")
+        self.assertIsNone(self.mgr.session_list()["listener"])
+
+    async def test_accept_n(self):
+        await self.mgr.listener_start(self.port, accept=2)
+        await self._connect_n(4)
+        self.assertEqual(len(self._live()), 2)
+        self.assertIsNone(self.mgr.listener)
+
+    async def test_accept_zero_is_unlimited(self):
+        r = await self.mgr.listener_start(self.port, accept=0)
+        self.assertIsNone(r["accept_remaining"])  # null = 무제한
+        await self._connect_n(3)
+        self.assertEqual(len(self._live()), 3)
+        self.assertIsNotNone(self.mgr.listener, "무제한인데 닫혔다")
+
+    async def test_requota_accumulates_across_calls(self):
+        # n 번 호출 = n 개 수락
+        for _ in range(3):
+            await self.mgr.listener_start(self.port)
+        self.assertEqual(self.mgr.listener.remaining, 3)
+        await self._connect_n(5)
+        self.assertEqual(len(self._live()), 3)
+        self.assertIsNone(self.mgr.listener)
+
+    # host 만 달라도 거부한다 — 조용히 무시된 채 쿼터만 오르면 안 된다
+    async def test_requota_refuses_different_host(self):
+        mgr = SessionManager(Config(allow_any_interface=True))
+        port = free_port()
+        await mgr.listener_start(port, host="127.0.0.1", accept=1)
+        r = await mgr.listener_start(port, host="0.0.0.0", accept=2)
+        self.assertIn("error", r)
+        self.assertIn("bind address", r["error"])
+        self.assertEqual(mgr.listener.remaining, 1)  # 쿼터가 오르면 안 된다
+        self.assertEqual(mgr.listener.host, "127.0.0.1")  # 바인드도 그대로
+        await mgr.close_all()
+
+    async def test_requota_refuses_different_port_message(self):
+        await self.mgr.listener_start(self.port)
+        r = await self.mgr.listener_start(free_port())
+        self.assertIn("error", r)
+        self.assertIn("port", r["error"])
+        self.assertEqual(self.mgr.listener.remaining, 1)
+
+    async def test_negative_accept_rejected(self):
+        r = await self.mgr.listener_start(self.port, accept=-1)
+        self.assertIn("error", r)
+        self.assertIsNone(self.mgr.listener)
+
+    # 살아있는 세션은 쿼터 소진에도 영향받지 않는다
+    async def test_quota_exhaustion_keeps_session(self):
+        await self.mgr.listener_start(self.port)
+        await self._connect_n(2)
+        sess = self._live()[0]
+        await wait_for(lambda: sess.has_pty is not None)
+        await sess.write(b"echo after-quota\n")
+        got, since = "", 0
+        for _ in range(10):
+            r = await self.mgr.session_read(sess.id, since=since, wait_ms=1000)
+            got += r["data"]
+            since = r["next_since"]
+            if "after-quota" in got:
+                break
+        self.assertIn("after-quota", got)
 
     # [4] mock target 접속 후 session_list 에 세션이 나타난다
     async def test_session_appears_in_list(self):
@@ -111,7 +199,7 @@ class ManagerTest(unittest.IsolatedAsyncioTestCase):
 
     # [5] 4개 동시 접속이 각각 독립 세션으로 잡힌다
     async def test_four_concurrent_sessions(self):
-        await self.mgr.listener_start(self.port)
+        await self.mgr.listener_start(self.port, accept=0)
         await asyncio.gather(*(self._target() for _ in range(4)))
         await wait_for(lambda: len(self.mgr.sessions) == 4)
         self.assertEqual(len(self.mgr.sessions), 4)
@@ -124,7 +212,7 @@ class ManagerTest(unittest.IsolatedAsyncioTestCase):
     async def test_max_sessions_rejects_and_closes(self):
         mgr = SessionManager(Config(max_sessions=2))
         port = free_port()
-        await mgr.listener_start(port)
+        await mgr.listener_start(port, accept=0)
         conns = []
         for _ in range(2):
             conns.append(await asyncio.open_connection("127.0.0.1", port))
@@ -143,7 +231,7 @@ class ManagerTest(unittest.IsolatedAsyncioTestCase):
     async def test_eviction_of_dead_sessions(self):
         mgr = SessionManager(Config(max_sessions=2))
         port = free_port()
-        await mgr.listener_start(port)
+        await mgr.listener_start(port, accept=0)
         for _ in range(2):
             _, w = await asyncio.open_connection("127.0.0.1", port)
             w.close()
@@ -389,7 +477,7 @@ class ManagerTest(unittest.IsolatedAsyncioTestCase):
     async def test_close_frees_a_slot(self):
         mgr = SessionManager(Config(max_sessions=2))
         port = free_port()
-        await mgr.listener_start(port)
+        await mgr.listener_start(port, accept=0)
         conns = [await asyncio.open_connection("127.0.0.1", port) for _ in range(2)]
         await wait_for(lambda: len(mgr.sessions) == 2)
         self.assertTrue(all(s.state == "active" for s in mgr.sessions.values()))
