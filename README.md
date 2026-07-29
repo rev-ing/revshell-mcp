@@ -30,8 +30,8 @@ listener_start(31338)  →  타겟이 콜백  →  session_exec("uname -a")
 ## 설치
 
 ```bash
-git clone <repo>
-cd reverse_shell_mcp
+git clone https://github.com/rev-ing/revshell-mcp.git
+cd revshell_mcp
 python3 -m venv .venv
 .venv/bin/pip install -e .
 ```
