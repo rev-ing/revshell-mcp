@@ -53,9 +53,17 @@ def build(cfg: Config) -> MCPServer:
         enough for many targets: any number of them can call back to the same
         listener and each becomes its own session.
 
-        Do not change the default host (127.0.0.1). Binding an unauthenticated
-        handler to all interfaces lets unintended hosts connect, so non-loopback
-        binds are refused unless the server was started with --allow-any-interface.
+        Keep the default host (127.0.0.1). Any other address is refused —
+        including a specific LAN IP such as 192.168.x.x, not only 0.0.0.0. There
+        is no "bind to just one interface" middle ground; only 127.0.0.1, ::1 and
+        localhost are allowed by default.
+
+        Lifting that requires --allow-any-interface in the server's REGISTERED
+        argv (e.g. `claude mcp add <name> -- <path>/revshell-mcp
+        --allow-any-interface`), followed by a client restart. It cannot be
+        toggled at runtime, and the server cannot be launched by hand for this —
+        the MCP client spawns it. If a non-loopback bind is refused, say so and
+        tell the user to re-register; do not suggest a different address.
         """
         return await mgr.listener_start(port, host)
 
