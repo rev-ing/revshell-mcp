@@ -31,10 +31,37 @@ listener_start(31338)  →  타겟이 콜백  →  session_exec("uname -a")
 
 ```bash
 git clone https://github.com/rev-ing/revshell-mcp.git
-cd revshell_mcp
+cd revshell-mcp
+./setup.sh
+```
+
+요구사항 확인 → 가상환경 생성 → 설치 → 검증까지 하고, 마지막에 **경로가 채워진 등록 명령어**를 출력합니다.
+
+```
+./setup.sh            기본
+./setup.sh --register  설치 후 Claude Code 에 자동 등록 (claude CLI 필요)
+./setup.sh --test      설치 후 전체 테스트까지 실행
+./setup.sh --force     기존 .venv 를 지우고 새로 만든다
+```
+
+`--register`를 주면 아래 등록 단계까지 한 번에 끝납니다. 이미 등록되어 있으면 경로를 갱신합니다.
+
+```bash
+git clone https://github.com/rev-ing/revshell-mcp.git && cd revshell-mcp
+./setup.sh --register     # 설치 + 등록
+# Claude Code 재시작
+```
+
+Python 3.11 미만이거나 `venv`가 없으면 배포판별 설치 명령을 안내하고 중단합니다. 재실행해도 안전합니다.
+
+<details>
+<summary>수동 설치</summary>
+
+```bash
 python3 -m venv .venv
 .venv/bin/pip install -e .
 ```
+</details>
 
 ## MCP 클라이언트 등록
 
@@ -44,7 +71,7 @@ python3 -m venv .venv
 claude mcp add revshell -s user -- /path/to/reverse_shell_mcp/.venv/bin/revshell-mcp
 ```
 
-등록 후 재시작하고 `/mcp`로 연결을 확인하세요.
+`./setup.sh`가 실제 경로가 들어간 명령을 그대로 출력해 주므로 복사해 쓰시면 됩니다. 등록 후 재시작하고 `/mcp`로 연결을 확인하세요.
 
 **그 외 클라이언트**
 
