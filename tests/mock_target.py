@@ -103,6 +103,27 @@ class MockTarget:
         if self._sock_w is not None:
             self._sock_w.close()
 
+    async def freeze(self) -> None:
+        """**half-open 을 재현한다** (§4.10).
+
+        소켓은 ESTABLISHED 그대로 두고 릴레이만 멈춘다. 서버 입장에서는 보내면
+        보내지고 read 는 영원히 안 끝나는, 실제 half-open 과 구별할 수 없는 상태가
+        된다. drop() 처럼 FIN 을 보내면 pump 가 EOF 를 보고 dead 로 전이해버려
+        정작 잡으려는 실패 양상이 사라진다 — 그 차이가 이 메서드의 존재 이유다.
+
+        중간 홉(SSH 역터널, NAT)이 조용히 사라진 경우가 여기 해당한다.
+        """
+        for t in self._tasks:
+            t.cancel()
+        for t in self._tasks:
+            try:
+                await t
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._tasks.clear()
+        # 셸도 멈춘다. 살아 있으면 프로브에 답해버려 stale 이 안 잡힌다.
+        await self.kill_shell()
+
     # ---- 파이프 모드 --------------------------------------------------
 
     def _env(self) -> dict:

@@ -89,7 +89,8 @@ claude mcp add revshell -s user -- /path/to/reverse_shell_mcp/.venv/bin/revshell
 
 ```
 revshell-mcp [--allow-any-interface] [--max-sessions 32]
-             [--buffer-bytes 1048576] [--log-level INFO]
+             [--buffer-bytes 1048576] [--heartbeat-sec 60]
+             [--log-level INFO]
 ```
 
 | 옵션 | 기본값 | 설명 |
@@ -97,6 +98,7 @@ revshell-mcp [--allow-any-interface] [--max-sessions 32]
 | `--allow-any-interface` | 꺼짐 | 루프백 외 바인드 허용 ([보안](#보안) 참조) |
 | `--max-sessions` | 32 | 동시 세션 상한 |
 | `--buffer-bytes` | 1 MiB | 세션당 링버퍼 크기 |
+| `--heartbeat-sec` | 60 | 유휴 세션 liveness 프로브 주기. `0`이면 끔 ([half-open](#세션은-조용히-죽습니다) 참조) |
 
 ## 빠른 시작
 
@@ -141,8 +143,8 @@ session_exec(session_id="sess_f97f", cmd="id")
 
 | 툴 | 상한 | 역할 |
 |---|---|---|
-| `listener_start(port, host="127.0.0.1", accept=1)` | 즉시 | 리스너 시작. 기본 1세션만 받고 자동 중단 |
-| `listener_stop()` | 즉시 | 포트 반납. 기존 세션은 유지 |
+| `listener_start(port, host="127.0.0.1", accept=1, rearm=false)` | 즉시 | 리스너 시작. 기본 1세션만 받고 자동 중단 |
+| `listener_stop()` | 즉시 | 포트 반납. 기존 세션은 유지. 재무장 취소 |
 | `session_list()` | 즉시 | 리스너 상태 + 세션 요약 |
 | `session_read(session_id, since=0, wait_ms=0, max_bytes=65536)` | `wait_ms` | 원시 스트림 증분 조회 |
 | `session_write(session_id, data, newline=true, confirm=false)` | 즉시 | 원시 전송. 완료 감지 없음 |
@@ -166,13 +168,30 @@ listener_start(31338, accept=2)    → accept_remaining: 3   (누적)
 listener_start(31338, "0.0.0.0")   → error (bind address 변경은 listener_stop 먼저)
 ```
 
+`rearm=true`면 세션을 잃을 때마다(끊김·`stale`·`session_close`) **리스너가 자동으로 다시 열립니다.** 재시도 루프를 도는 타겟이 알아서 재접속하므로 무인 운용이 됩니다. 자세한 건 아래 [자동 재무장](#링크가-불안정하면-자동-재무장을-켜세요)을 보세요.
+
 ### `listener_stop()`
 
 리스닝 소켓만 닫고 포트를 반납합니다. 이미 붙어 있는 세션은 건드리지 않습니다.
 
+**자동 재무장도 함께 취소합니다.** 재무장을 끄는 방법은 이것뿐입니다.
+
 ### `session_list()`
 
-반환은 `{"listener": {...} | null, "sessions": [...]}` 형태입니다. `listener`가 `null`이면 리스너가 없는 것 — 시작한 적이 없거나, 중단했거나, **수락 쿼터를 채워 스스로 닫힌** 상태입니다. `accept_remaining`은 앞으로 몇 개를 더 받을지이며 `null`은 무제한입니다.
+반환은 `{"listener": {...} | null, "rearm": {...} | null, "sessions": [...]}` 형태입니다. `listener`가 `null`이면 리스너가 없는 것 — 시작한 적이 없거나, 중단했거나, **수락 쿼터를 채워 스스로 닫힌** 상태입니다. `accept_remaining`은 앞으로 몇 개를 더 받을지이며 `null`은 무제한입니다.
+
+`rearm`이 `listener` 밖에 있는 이유는, 재무장을 기다리는 동안에는 `listener`가 `null`이기 때문입니다 — 안에 넣으면 정작 알아야 할 때 사라집니다.
+
+세션 한 줄의 주요 필드:
+
+| 필드 | 뜻 |
+|---|---|
+| `state` | `active` / `stale` / `dead` — 아래 [half-open](#세션은-조용히-죽습니다) 참고 |
+| `age_sec` | 접속 후 경과. **liveness와 무관합니다** |
+| `last_rx_sec` | 마지막 수신 후 경과. **판단은 이 값으로 하세요** |
+| `busy` | `session_exec` 실행 중 |
+| `has_pty` | 아래 [PTY 판별](#pty-판별) 참고 |
+| `write_stalled` | drain 타임아웃 — 보냈지만 도달은 미확인 |
 
 세션 각 행의 필드:
 
@@ -213,12 +232,12 @@ listener_start(31338, "0.0.0.0")   → error (bind address 변경은 listener_st
 | 필드 | 의미 |
 |---|---|
 | `output` | 프레임 안쪽만. 에코·프롬프트·마커 제거됨 |
-| `exit_code` | 종료코드. 미완료면 `null` |
+| `exit_code` | 종료코드. 미완료거나 백그라운드면 `null` |
 | `next_since` | 이어읽기용 커서. 거부되면 `null` |
-| `complete` | `false`는 실패가 아니라 미완료 |
+| `complete` | `false`는 대개 미완료. 단 `hint`를 먼저 읽으세요 |
 | `truncated` | 링버퍼 유실로 출력 중간이 사라짐 |
 | `capped` | `max_bytes` 초과로 가운데를 잘라냄. 앞뒤는 보존 |
-| `hint` | `complete: false`일 때 후속 안내 |
+| `hint` | 후속 안내. 주로 `complete: false`일 때이고, 백그라운드 성공에도 붙습니다 |
 
 </details>
 
@@ -269,10 +288,12 @@ session_exec:  output: "uid=1000(irev) gid=1000(irev) ..."   exit_code: 0
 |---|---|
 | 빈 문자열 | 구문 에러 |
 | 개행 포함 | `$?`가 마지막 줄의 것이 됨 |
-| `; \| & && \|\| > < >>`로 끝남 | 구문 에러 또는 뒷부분 흡수 |
+| `; \| && \|\| > < >>`로 끝남 | 구문 에러 또는 뒷부분 흡수 |
 | `\`로 끝남 | 종료 마커가 인자로 흡수됨 |
 | 따옴표 밖 `#` 주석 | 종료 마커까지 주석 처리 → 타임아웃 |
 | 따옴표 불균형 | 셸이 continuation 상태로 남아 세션 오염 |
+
+**끝의 `&` 하나는 거부되지 않습니다** — [백그라운드 실행](#백그라운드-실행)으로 처리됩니다.
 
 아래는 통과합니다.
 
@@ -281,9 +302,81 @@ find . -name '*.log' -exec rm {} \;    # 이스케이프된 ; 는 연산자가 �
 echo "it's fine"                       # " 안의 홀수 개 ' 는 정상
 echo a#b                               # 단어 중간의 # 는 주석이 아님
 rm -rf /tmp/build                      # 루트가 아니므로 통과
+nohup ./agent >/tmp/log 2>&1 &         # 백그라운드 — exit_code 는 null
 ```
 
 여러 줄이 필요하면 `session_write`를 쓰세요.
+
+### 세션은 조용히 죽습니다
+
+`state: "active"`만 보고 세션이 살아 있다고 믿으면 안 됩니다. **TCP가 half-open이 되면 로컬 소켓은 `ESTABLISHED`로 남습니다** — 특히 SSH 역터널이나 NAT를 거치는 경로에서, 중간 홉이 사라져도 커널은 아무것도 눈치채지 못합니다. 실제로 21시간째 `active`로 떠 있던 세션이 이미 죽어 있던 사례가 있습니다.
+
+이 경우 예전에는 이렇게 보였습니다:
+
+```
+session_exec  → complete: false, output 없음
+                hint: "may still be running... continue with session_read"
+session_read(wait_ms=8000) → 빈 응답
+```
+
+힌트를 믿고 계속 기다리게 되는 게 진짜 문제였습니다. 지금은 세 가지로 대응합니다.
+
+**1. `last_rx_sec`을 보세요.** `age_sec`은 접속 후 흐른 시간이라 죽은 세션도 계속 나이를 먹습니다. 둘이 비슷하게 커져 있으면 링크가 죽은 겁니다.
+
+```
+age_sec: 81084, last_rx_sec: 0.4     → 살아 있음
+age_sec: 81084, last_rx_sec: 80012   → 죽었음
+```
+
+**2. `state: "stale"`** — 유휴 세션에 주기적으로 no-op을 보내 응답을 확인합니다(기본 60초, `--heartbeat-sec 0`으로 끔). 무응답이면 `stale`이 됩니다.
+
+`stale`은 **추정이지 확정이 아닙니다.** 링크가 half-open이거나, 셸이 `session_write`로 받은 긴 명령에 물려 있거나 둘 중 하나이며 서버는 구분할 수 없습니다. 그래서 아무것도 파괴하지 않고, **한 바이트만 수신해도 즉시 `active`로 돌아옵니다.** 계속 `stale`이면 `session_close` 하세요.
+
+> 커널 TCP keepalive로는 못 잡습니다. keepalive는 **이 소켓의 상대편**만 검사하는데, `ssh -R` 뒤에서 그 상대편은 로컬 sshd입니다. 앱 레벨 왕복만이 링크 전체를 검사합니다.
+
+**3. 힌트가 달라집니다.** `stale` 세션에서 명령이 타임아웃하면 "아직 실행 중일 수 있다"가 아니라 half-open 가능성과 `session_close`를 안내합니다.
+
+부작용: 하트비트도 프레임을 쓰므로 `session_read`에 `__S…__` / `__E…__0` 두 줄이 주기적으로 보입니다. `session_exec` 출력에서는 제거됩니다. 또 프로브가 도는 짧은 순간에 `session_exec`을 부르면 `busy`가 올 수 있습니다 — 그대로 재시도하면 됩니다.
+
+### 링크가 불안정하면 자동 재무장을 켜세요
+
+`accept` 쿼터가 막는 건 **붙어 있는 동안의 폭주**이지 **끊긴 뒤의 복구**가 아닙니다. 세션이 끊기면 리스너는 이미 닫혀 있으므로 매번 손으로 다시 열어야 했습니다.
+
+```
+listener_start(31338, rearm=true)
+```
+
+세션을 잃을 때마다(끊김·`stale`·`session_close`) 리스너가 자동으로 다시 열립니다. 타겟이 30초 주기로 재시도한다면 그대로 재접속됩니다.
+
+- 세션 하나당 **한 번만** 재무장합니다. `stale`↔`active`를 오가도 폭주하지 않습니다.
+- `--max-sessions` 여유가 없으면 보류합니다.
+- **끄는 방법은 `listener_stop()`뿐입니다.**
+- 대기 중인지는 `session_list()`의 `rearm`으로 확인합니다.
+
+### 백그라운드 실행
+
+`cmd &`를 그대로 쓸 수 있습니다.
+
+```
+session_exec("nohup /tmp/agent >/tmp/agent.log 2>&1 &")
+  → complete: true, exit_code: null
+```
+
+`exit_code`가 `null`인 이유는 셸이 **기동 사실만** 알려주고 결과는 알려주지 않기 때문입니다(POSIX에서 비동기 리스트의 종료 상태는 항상 0입니다). 그 0을 성공으로 오독하지 않도록 지웁니다.
+
+- **출력은 리다이렉트하세요.** 잡의 stdout은 계속 이 세션으로 흘러들어 이후 명령 출력과 섞입니다.
+- PID는 `session_exec("echo $!")`로 회수합니다.
+- `&&`는 여전히 거부됩니다 — 그건 미완성 명령이지 백그라운드가 아닙니다.
+
+### 타겟이 busybox면 감안하세요
+
+임베디드 타겟은 대개 busybox입니다. `awk`에 `strtonum`이 없고, `df`·`ps` 출력 형식이 GNU 계열과 다르고, `timeout`·`pidof` 옵션이 축소돼 있습니다. 이 서버는 셸 종류를 판별하지 않으므로 **명령이 실패하면 먼저 그쪽을 의심하세요.**
+
+`has_pty: false`인 세션에서는 특히 조심해야 합니다. 막히는 명령을 중단할 수단이 없어서 `session_close`가 유일한 탈출구입니다:
+
+- 인자 없는 `cat`, `python`, `sh` 같이 stdin을 먹는 명령을 피하세요
+- 페이저·에디터(`less`, `vi`)를 피하세요
+- 끝이 없을 수 있는 명령엔 `| head -n 50`을 붙이세요
 
 ### 리스너는 기본적으로 1개만 받고 닫힙니다
 

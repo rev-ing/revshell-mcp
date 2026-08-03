@@ -24,6 +24,14 @@ DEFAULT_READ_MAX_BYTES = 65536
 PTY_PROBE_CMD = "test -t 0"
 PTY_PROBE_TIMEOUT = 5.0
 
+# liveness 하트비트 (§4.10). `:` 는 POSIX 셸 내장 no-op 이라 busybox ash 에도
+# 있고 부작용도 출력도 없다 — 프레임 마커 두 줄만 오간다.
+LIVENESS_CMD = ":"
+HEARTBEAT_TIMEOUT = 10.0
+DEFAULT_HEARTBEAT_SEC = 60.0
+# 감시 루프 주기. 하트비트 간격과 별개다 — 재무장(§4.11)은 하트비트를 꺼도 돈다.
+SUPERVISOR_TICK = 2.0
+
 
 def new_id(prefix: str) -> str:
     return f"{prefix}_{secrets.token_hex(2)}"
@@ -34,6 +42,9 @@ class Config:
     allow_any_interface: bool = False  # --allow-any-interface (§4.1)
     max_sessions: int = DEFAULT_MAX_SESSIONS
     buffer_bytes: int = DEFAULT_BUFFER_BYTES
+    # 이 시간 동안 한 바이트도 못 받은 유휴 세션에 liveness 프로브를 보낸다.
+    # 0 이면 하트비트를 끈다 (§4.10).
+    heartbeat_sec: float = DEFAULT_HEARTBEAT_SEC
 
 
 @dataclass
@@ -51,18 +62,30 @@ class SessionManager:
         self.cfg = cfg or Config()
         self.sessions: dict[str, Session] = {}
         self.listener: Listener | None = None
-        self._probes: set[asyncio.Task] = set()  # PTY 판별 태스크 강한 참조
+        self._probes: set[asyncio.Task] = set()  # 프로브 태스크 강한 참조
+        self._probing: set[str] = set()  # 프로브가 떠 있는 세션 id
+        self._supervisor: asyncio.Task | None = None
+        # 자동 재무장 대상 (host, port). None 이면 끔 (§4.11).
+        self._rearm: tuple[str, int] | None = None
 
     # ---- 리스너 -------------------------------------------------------
 
     async def listener_start(
-        self, port: int, host: str = "127.0.0.1", accept: int = 1
+        self,
+        port: int,
+        host: str = "127.0.0.1",
+        accept: int = 1,
+        rearm: bool = False,
     ) -> dict:
         """바인드 게이트와 수락 쿼터 (§4.1, §4.9). accept 를 기다리지 않고 즉시 반환한다.
 
         accept 만큼 세션을 받으면 리스너가 스스로 닫힌다(기본 1). 0 이면 무제한.
         재시도 루프를 도는 임플란트가 붙어 있으면 무제한 리스너는 30초마다 세션을
         하나씩 쌓아 max_sessions 를 포화시키므로, 기본값을 1 로 둔다.
+
+        rearm=True 면 세션을 잃을 때마다 리스너를 자동으로 다시 연다 (§4.11).
+        쿼터가 막는 것은 '붙어 있는 동안의 폭주' 이지 '끊긴 뒤의 복구' 가 아닌데,
+        그 복구가 수동이라 세션이 끊길 때마다 사람이 재무장해야 했다.
         """
         # 인증 없는 셸 핸들러를 전 인터페이스에 여는 것은 아무나 붙을 수 있다는 뜻이다.
         # host 가 자유 인자이므로 기본값이 루프백인 것만으로는 부족하다.
@@ -83,6 +106,7 @@ class SessionManager:
                     lsn.remaining = None
                 else:
                     lsn.remaining += accept
+                self._set_rearm(rearm, host, port)
                 return self._listener_info()
             # host 만 다른 경우도 거부한다. 포트만 비교하면 요청한 주소가 조용히
             # 무시된 채 쿼터만 오르고, 호출자는 0.0.0.0 에 열렸다고 착각한다.
@@ -100,12 +124,24 @@ class SessionManager:
             id=new_id("lsn"), host=host, port=port, server=server,
             remaining=None if accept == 0 else accept,
         )
+        self._set_rearm(rearm, host, port)
+        self._ensure_supervisor()
         log.info(
-            "listening on %s:%d (%s, accept=%s)",
+            "listening on %s:%d (%s, accept=%s, rearm=%s)",
             host, port, self.listener.id,
-            "unlimited" if accept == 0 else accept,
+            "unlimited" if accept == 0 else accept, rearm,
         )
         return self._listener_info()
+
+    def _set_rearm(self, rearm: bool, host: str, port: int) -> None:
+        """요청이 받아들여졌을 때만 재무장 의도를 갱신한다 (§4.11).
+
+        rearm=False 로는 지우지 않는다 — 자동 재무장 자신이 rearm=False 로
+        listener_start 를 부르므로, 여기서 지우면 두 번째 상실부터 복구가 멎는다.
+        끄는 경로는 listener_stop() 하나뿐이고 그건 명시적 취소다.
+        """
+        if rearm:
+            self._rearm = (host, port)
 
     async def listener_stop(self) -> dict:
         """리스닝 소켓만 닫고 포트를 반납한다 (§4.7).
@@ -115,7 +151,13 @@ class SessionManager:
         "붙어 있는 셸을 끊는다"는 완전히 별개다. 세션을 끊는 건 session_close 다.
 
         멱등하다. 리스너가 없으면 에러 대신 stopped=False 를 돌려준다.
+
+        자동 재무장(§4.11) 의도도 함께 취소한다. "그만 받겠다" 는 명시적 지시인데
+        잠시 뒤 감시 루프가 다시 열어버리면 이 툴이 하는 말과 반대로 동작한다.
+        리스너가 없어 stopped=False 인 경우에도 의도는 지운다 — 재무장 대기 중인
+        상태를 끄는 방법이 달리 없기 때문이다.
         """
+        self._rearm = None
         if self.listener is None:
             return {"listener_id": None, "host": None, "port": None, "stopped": False}
         lsn = self.listener
@@ -193,11 +235,23 @@ class SessionManager:
         )
         self.sessions[sess.id] = sess
         sess.pump_task = asyncio.create_task(sess.pump())
+        self._ensure_supervisor()
         # 콜백에서 기다리지 않는다. 판별이 끝날 때까지 has_pty 는 None 이다.
-        probe = asyncio.create_task(self._probe_pty(sess))
-        self._probes.add(probe)
-        probe.add_done_callback(self._probes.discard)
+        self._spawn_probe(sess, self._probe_pty(sess))
         log.info("session %s from %s", sess.id, sess.peer)
+
+    def _spawn_probe(self, sess: Session, coro) -> None:
+        """프로브를 띄우고 강한 참조를 잡는다. 세션당 동시에 하나만 띄운다.
+
+        _probing 가드가 없으면 감시 루프가 매 tick 마다 같은 세션에 프로브를
+        쌓는다. 프로브 하나가 최대 HEARTBEAT_TIMEOUT 을 쓰므로 그 사이 tick 이
+        여러 번 지나가기 때문이다.
+        """
+        self._probing.add(sess.id)
+        t = asyncio.create_task(coro)
+        self._probes.add(t)
+        t.add_done_callback(self._probes.discard)
+        t.add_done_callback(lambda _: self._probing.discard(sess.id))
 
     async def _probe_pty(self, sess: Session) -> None:
         """연결 직후 1회만 PTY 여부를 판별한다 (§4.8).
@@ -205,18 +259,129 @@ class SessionManager:
         실패해도 세션은 유효해야 하므로 예외를 밖으로 내지 않는다. 판별 실패 시
         has_pty 는 None 으로 남고, 그건 "PTY 가 없다"가 아니라 "모른다"는 뜻이다.
 
-        exec_lock 을 잡으므로 판별이 끝나기 전에 session_exec 이 들어오면 busy 로
-        즉시 반환된다. 창은 짧고 busy hint 가 재시도를 안내하므로 그대로 둔다.
+        exec_lock 을 직접 잡고 run_framed 를 부른다. execute 를 쓰면 락 경합 시
+        _busy 를 돌려받는데, 그건 판별 실패와 구분되지 않는다 (§4.10).
         """
         try:
             from . import executor  # 지연 import — executor 는 manager 를 모른다
 
-            r = await executor.execute(sess, PTY_PROBE_CMD, timeout=PTY_PROBE_TIMEOUT)
+            async with sess.exec_lock:
+                r = await executor.run_framed(
+                    sess, PTY_PROBE_CMD, timeout=PTY_PROBE_TIMEOUT
+                )
             if r.get("complete") and r.get("exit_code") in (0, 1):
                 sess.has_pty = r["exit_code"] == 0
                 log.info("session %s has_pty=%s", sess.id, sess.has_pty)
         except Exception:
             log.warning("PTY 판별 실패 %s", sess.id, exc_info=True)
+
+    # ---- 감시 루프 (§4.10, §4.11) ---------------------------------------
+
+    def _ensure_supervisor(self) -> None:
+        """감시 루프를 띄운다. 생성자가 아니라 여기서 띄우는 이유는, build(cfg) 가
+        이벤트 루프가 돌기 전에 불리기 때문이다."""
+        if self._supervisor is None or self._supervisor.done():
+            self._supervisor = asyncio.create_task(self._supervise())
+
+    async def _supervise(self) -> None:
+        """유휴 세션 liveness 프로브(§4.10)와 리스너 자동 재무장(§4.11).
+
+        한 번의 예외로 감시가 통째로 멎으면 안 된다 — 그러면 half-open 이
+        영원히 active 로 남는, 애초에 고치려던 상태로 조용히 되돌아간다.
+        그래서 tick 안쪽만 감싼다. sleep 에서 오는 CancelledError 는 그대로 나간다.
+        """
+        while True:
+            await asyncio.sleep(SUPERVISOR_TICK)
+            try:
+                await self._rearm_sweep()
+                self._heartbeat_sweep()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.warning("감시 루프 tick 실패", exc_info=True)
+
+    def _heartbeat_sweep(self) -> None:
+        """유휴 세션에 프레임 no-op 을 쏜다 (§4.10).
+
+        exec_lock 이 잡혀 있으면 건너뛴다. 사용자 명령이 도는 중에 프로브를 쏘면
+        셸 stdin 에서 그 명령 뒤에 줄을 서게 되고, 응답이 없는 이유가 '링크가
+        죽어서' 인지 '앞 명령이 안 끝나서' 인지 구분할 수 없어진다.
+
+        stale 세션도 계속 프로브한다 — 회복을 감지할 다른 경로가 없다.
+        """
+        idle_limit = self.cfg.heartbeat_sec
+        if idle_limit <= 0:  # --heartbeat-sec 0 = 끔
+            return
+        now = time.time()
+        for sess in list(self.sessions.values()):
+            if sess.state == "dead" or sess.id in self._probing:
+                continue
+            if sess.exec_lock.locked():
+                continue
+            if now - sess.last_rx < idle_limit:
+                continue
+            self._spawn_probe(sess, self._probe_liveness(sess))
+
+    async def _probe_liveness(self, sess: Session) -> None:
+        """프레임 no-op 한 번. 응답이 없으면 stale 로 내린다 (§4.10).
+
+        **stale 은 추정이지 확정이 아니다.** 링크가 half-open 이거나, 셸이
+        session_write 로 받은 긴 명령에 물려 있거나 둘 중 하나다. 그래서 dead 로
+        올리지 않고 아무것도 파괴하지 않는다 — 한 바이트만 와도 mark_rx 가
+        active 로 되돌린다.
+        """
+        try:
+            from . import executor
+
+            if sess.exec_lock.locked():
+                return  # tick 과 acquire 사이에 명령이 들어왔다. 정보 없음.
+            async with sess.exec_lock:
+                r = await executor.run_framed(
+                    sess, LIVENESS_CMD, timeout=HEARTBEAT_TIMEOUT
+                )
+            # 성공 시 별도 처리가 없다: 응답 바이트가 pump 를 거치며 mark_rx 가
+            # 이미 last_rx 를 갱신하고 stale 을 풀었다.
+            if not r.get("complete") and sess.state == "active":
+                sess.state = "stale"
+                log.warning(
+                    "session %s stale — liveness 프로브 무응답 (%.0fs 무수신)",
+                    sess.id, time.time() - sess.last_rx,
+                )
+        except Exception:
+            log.warning("liveness 프로브 실패 %s", sess.id, exc_info=True)
+
+    async def _rearm_sweep(self) -> None:
+        """세션을 잃었으면 리스너를 다시 연다 (§4.11).
+
+        세션당 한 번만 센다(rearm_fired). 안 그러면 stale 을 오가는 세션 하나가
+        재무장을 무한히 유발해 임플란트의 재시도 루프와 함께 세션을 쌓는다.
+        """
+        if self._rearm is None:
+            return
+        lost = [
+            s
+            for s in self.sessions.values()
+            if s.state in ("dead", "stale") and not s.rearm_fired
+        ]
+        if not lost:
+            return
+        for s in lost:
+            s.rearm_fired = True
+        if self.listener is not None:
+            return  # 이미 열려 있다 — 쿼터가 남아 있으므로 추가로 할 일이 없다
+        live = sum(1 for s in self.sessions.values() if s.state == "active")
+        if live + len(lost) > self.cfg.max_sessions:
+            log.warning("재무장 보류 — max_sessions 여유가 없다")
+            return
+        host, port = self._rearm
+        r = await self.listener_start(port, host, accept=len(lost))
+        if "error" in r:
+            # 흔한 경우는 포트가 아직 TIME_WAIT 인 것이다. 다음 tick 에 다시 온다.
+            for s in lost:
+                s.rearm_fired = False
+            log.warning("재무장 실패, 다음 tick 에 재시도: %s", r["error"])
+        else:
+            log.info("세션 %d개 상실 — %s:%d 재무장", len(lost), host, port)
 
     def _evict_one_dead(self) -> bool:
         """상한 도달 시 가장 오래된 dead 세션을 치운다. reaper 대용 (§4.2).
@@ -237,8 +402,16 @@ class SessionManager:
     def session_list(self) -> dict:
         # 리스너 상태를 조회할 다른 수단이 없으므로 여기 함께 싣는다.
         # 자동 중단(§4.9)됐는지 확인하려면 이 필드를 봐야 한다.
+        #
+        # rearm 은 listener 안이 아니라 밖에 둔다. 재무장을 기다리는 동안은
+        # listener 가 null 이라, 안에 넣으면 정작 알아야 할 때 사라진다 (§4.11).
         return {
             "listener": self._listener_info() if self.listener else None,
+            "rearm": (
+                {"host": self._rearm[0], "port": self._rearm[1]}
+                if self._rearm
+                else None
+            ),
             "sessions": [s.summary() for s in self.sessions.values()],
         }
 
@@ -320,9 +493,14 @@ class SessionManager:
     # ---- 종료 ---------------------------------------------------------
 
     async def close_all(self) -> None:
+        self._rearm = None  # 종료 중에 재무장이 새 리스너를 열면 안 된다
+        if self._supervisor is not None:
+            self._supervisor.cancel()
+            self._supervisor = None
         for probe in list(self._probes):
             probe.cancel()
         self._probes.clear()
+        self._probing.clear()
         # 순서가 중요하다: 세션을 먼저 끊어야 wait_closed() 가 끝난다 (§4.7 참조).
         # 반대로 하면 3.12 의 wait_closed 가 살아있는 연결을 기다리며 멈춘다.
         for sess in list(self.sessions.values()):

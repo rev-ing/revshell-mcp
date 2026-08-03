@@ -146,13 +146,26 @@ class Session:
     writer: asyncio.StreamWriter
     peer: tuple[str, int]
     opened_at: float = field(default_factory=time.time)  # §4.2 퇴출 정렬, §2.2 age_sec
-    state: str = "active"  # "active" | "dead"
+    # "active" | "stale" | "dead" (§4.10).
+    #   active — 정상. dead — 소켓이 닫혔다. 여기까지는 확정 사실이다.
+    #   stale  — TCP 는 열려 있는데 프레임 프로브에 답하지 않았다. **추정**이다.
+    #            half-open 이거나 셸이 멎었거나 둘 중 하나이며, 한 바이트라도
+    #            수신하면 즉시 active 로 돌아온다.
+    # dead 만이 종료를 뜻하므로, 다른 모듈의 판정은 전부 `== "dead"` 로 유지한다.
+    # stale 을 종료로 취급하면 회복 가능한 세션을 버리게 된다.
+    state: str = "active"
     buffer: Buffer = field(default_factory=Buffer)
     exec_lock: asyncio.Lock = field(default_factory=asyncio.Lock)  # §2.2 busy
     write_stalled: bool = False  # §4.5
     pump_task: asyncio.Task | None = None
     # None = 아직 모름/판별 실패. 판별 실패해도 세션은 유효해야 한다 (§4.8).
     has_pty: bool | None = None
+    # 마지막으로 '한 바이트라도' 받은 시각 (§4.10). age_sec 은 세션이 생긴 뒤
+    # 흐른 시간이라 half-open 을 전혀 드러내지 못한다 — age 는 커지는데 링크는
+    # 몇 시간 전에 끊겼을 수 있다. 판단에 쓸 수 있는 값은 이쪽이다.
+    last_rx: float = field(default_factory=time.time)
+    # 이 세션의 상실로 리스너를 이미 재무장했는가 (§4.11). 세션당 한 번만 센다.
+    rearm_fired: bool = False
 
     # ---- I/O ----------------------------------------------------------
 
@@ -186,6 +199,7 @@ class Session:
                 data = await self.reader.read(READ_CHUNK)
                 if not data:
                     break
+                self.mark_rx()
                 await self.buffer.append(data)
         # ---- 취소 경로: await 금지, 반드시 re-raise ----
         except asyncio.CancelledError:
@@ -199,6 +213,19 @@ class Session:
         self.state = "dead"
         await self.buffer.bump_gen()
         self._close_writer()
+
+    def mark_rx(self) -> None:
+        """수신 시각을 갱신하고 stale 을 해제한다 (§4.10).
+
+        stale 은 '프로브에 답하지 않았다'는 추정일 뿐이므로, 실제로 바이트가
+        오면 그 추정은 그 자리에서 틀린 것이 된다. 회복 경로를 프로브 성공에만
+        의존시키면 안 된다 — 오래 걸리던 명령이 뒤늦게 출력을 뱉는 경우가
+        프로브 주기보다 흔하다.
+        """
+        self.last_rx = time.time()
+        if self.state == "stale":
+            log.info("session %s stale 해제 (수신 재개)", self.id)
+            self.state = "active"
 
     def _notify_detached(self) -> None:
         """취소된 태스크는 await 할 수 없으므로 별도 태스크로 통지한다 (§4.3).
@@ -228,6 +255,9 @@ class Session:
             "peer": f"{self.peer[0]}:{self.peer[1]}" if self.peer else None,
             "state": self.state,
             "age_sec": round(time.time() - self.opened_at, 1),
+            # age_sec 과 나란히 놓고 보라고 옆에 둔다. 둘이 크게 벌어지지 않으면
+            # (age 는 큰데 last_rx 도 큰) 링크가 죽은 것이다 (§4.10).
+            "last_rx_sec": round(time.time() - self.last_rx, 1),
             "end_cursor": self.buffer.end(),
             "buffered_bytes": self.buffer.buffered(),
             "busy": self.exec_lock.locked(),

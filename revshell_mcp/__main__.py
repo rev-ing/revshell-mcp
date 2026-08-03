@@ -10,7 +10,7 @@ import argparse
 import logging
 import sys
 
-from .manager import DEFAULT_MAX_SESSIONS, Config
+from .manager import DEFAULT_HEARTBEAT_SEC, DEFAULT_MAX_SESSIONS, Config
 from .session import DEFAULT_BUFFER_BYTES
 
 
@@ -24,6 +24,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument("--max-sessions", type=int, default=DEFAULT_MAX_SESSIONS)
     ap.add_argument("--buffer-bytes", type=int, default=DEFAULT_BUFFER_BYTES)
+    ap.add_argument(
+        "--heartbeat-sec",
+        type=float,
+        default=DEFAULT_HEARTBEAT_SEC,
+        help="이 시간 동안 수신이 없는 유휴 세션에 liveness 프로브를 보낸다. "
+        "half-open TCP 를 잡아내는 유일한 수단이다 — 커널 keepalive 는 SSH "
+        "역터널 뒤에서 무력하다. 0 이면 끈다.",
+    )
     ap.add_argument("--log-level", default="INFO")
     args = ap.parse_args(argv)
 
@@ -37,6 +45,7 @@ def main(argv: list[str] | None = None) -> int:
         allow_any_interface=args.allow_any_interface,
         max_sessions=args.max_sessions,
         buffer_bytes=args.buffer_bytes,
+        heartbeat_sec=args.heartbeat_sec,
     )
 
     try:

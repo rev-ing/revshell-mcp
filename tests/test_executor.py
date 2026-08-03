@@ -44,6 +44,15 @@ def drive(chunks, max_bytes=65536, s=S, e=E):
 # ---------------------------------------------------------------------------
 
 
+def err_of(cmd: str, confirm: bool = False) -> str | None:
+    """_validate_all 은 (error, background) 를 돌려준다 (§5.1)."""
+    return _validate_all(cmd, confirm)[0]
+
+
+def bg_of(cmd: str) -> bool:
+    return _validate_all(cmd, confirm=False)[1]
+
+
 class ValidationTest(unittest.TestCase):
     # [12] 거부되어야 하는 것들
     def test_rejects(self):
@@ -53,8 +62,6 @@ class ValidationTest(unittest.TestCase):
             "   ": "empty",
             "ls;": "operator",
             "ls \\": "escape",
-            "ls &": "operator",
-            "ls &  ": "operator",  # strip 이후에 검사해야 잡힌다
             "echo hi >": "operator",
             "echo hi >>": "operator",
             "cat a |": "operator",
@@ -68,7 +75,7 @@ class ValidationTest(unittest.TestCase):
         }
         for cmd, expect in cases.items():
             with self.subTest(cmd=cmd):
-                err = _validate_all(cmd, confirm=False)
+                err = err_of(cmd)
                 self.assertIsNotNone(err, f"{cmd!r} 가 통과했다")
                 self.assertIn(expect, err)
 
@@ -90,7 +97,21 @@ class ValidationTest(unittest.TestCase):
         ]
         for cmd in cases:
             with self.subTest(cmd=cmd):
-                self.assertIsNone(_validate_all(cmd, confirm=False), f"{cmd!r} 가 거부됐다")
+                self.assertIsNone(err_of(cmd), f"{cmd!r} 가 거부됐다")
+
+    # [14] 끝의 bare & 는 거부하지 않고 background 로 표시한다 (§5.1)
+    def test_trailing_ampersand_is_background_not_rejection(self):
+        for cmd in ["sleep 100 &", "sleep 100 &  ", "a & b &", "nohup x >/l 2>&1 &"]:
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(err_of(cmd), f"{cmd!r} 가 거부됐다")
+                self.assertTrue(bg_of(cmd), f"{cmd!r} 가 background 로 안 잡혔다")
+
+    def test_ampersand_variants_are_not_background(self):
+        # && 는 여전히 미완성 명령이고, 따옴표 안의 & 는 연산자가 아니다
+        self.assertIsNotNone(err_of("a && "))
+        self.assertFalse(bg_of("echo 'ls &'"))
+        self.assertFalse(bg_of("a & b"))  # 끝이 & 가 아니면 평범한 체인이다
+        self.assertFalse(bg_of("ls"))
 
     # [11] 파괴적 명령 게이트 — 좁게 잡는다
     def test_destructive_gate(self):
@@ -99,13 +120,14 @@ class ValidationTest(unittest.TestCase):
                    "shutdown -h now", "reboot", ":(){ :|:& };:"]
         for cmd in blocked:
             with self.subTest(cmd=cmd):
-                self.assertIsNotNone(_validate_all(cmd, confirm=True) or None
-                                     if False else _validate_all(cmd, confirm=False))
+                self.assertIsNotNone(err_of(cmd))
         # confirm=True 면 통과한다
-        self.assertIsNone(_validate_all("rm -rf /", confirm=True))
+        self.assertIsNone(err_of("rm -rf /", confirm=True))
         # 오탐이 게이트 자체보다 위험하다 — /tmp 는 통과
-        self.assertIsNone(_validate_all("rm -rf /tmp/build", confirm=False))
-        self.assertIsNone(_validate_all("rm -rf ./build", confirm=False))
+        self.assertIsNone(err_of("rm -rf /tmp/build"))
+        self.assertIsNone(err_of("rm -rf ./build"))
+        # 백그라운드 조립 경로가 게이트를 건너뛰지 않는다
+        self.assertIsNotNone(err_of("rm -rf / &"))
 
     def test_mask_preserves_length(self):
         # 마스크 길이가 원문과 1:1 이어야 out[-1] 기준 주석 판정이 어긋나지 않는다
@@ -116,7 +138,7 @@ class ValidationTest(unittest.TestCase):
 
     def test_escaped_space_is_not_word_boundary(self):
         # echo a\ #b 는 '한 단어' 이므로 # 는 주석이 아니다
-        self.assertIsNone(_validate_all("echo a\\ #b", confirm=False))
+        self.assertIsNone(err_of("echo a\\ #b"))
 
 
 # ---------------------------------------------------------------------------

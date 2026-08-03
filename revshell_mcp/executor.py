@@ -112,22 +112,30 @@ def _check_destructive(c: str, confirm: bool) -> str | None:
     return None
 
 
-def _validate_all(cmd: str, confirm: bool) -> str | None:
+def _validate_all(cmd: str, confirm: bool) -> tuple[str | None, bool]:
+    """returns (error, background). background 는 끝의 bare `&` 를 뜻한다 (§5.1)."""
     c = cmd.strip()  # strip 전에 검사하면 'ls &  ' 같은 입력이 샌다
     if not c:
-        return "empty command"
+        return "empty command", False
     if "\n" in c or "\r" in c:
-        return "newlines are not allowed; send multi-line input with session_write"
+        return (
+            "newlines are not allowed; send multi-line input with session_write",
+            False,
+        )
     err, bare = _scan_shell(c)  # ← 트레일링 검사보다 반드시 먼저
     if err:
-        return err
+        return err, False
     assert bare is not None
-    if bare.endswith(_TRAILING):
-        return (
-            "command ends with a shell operator. To background a job, send "
-            "`nohup cmd >/tmp/log 2>&1 &` with session_write and read the log."
-        )
-    return _check_destructive(c, confirm)
+
+    # 끝의 bare `&` 는 거부하지 않고 조립 방식을 바꿔서 받는다 (§5.1).
+    # `&` 는 그 자체가 명령 구분자라 뒤에 `;` 를 붙이면 `& ;` 가 되어 parse error 다.
+    # 예전에는 그래서 통째로 거부했지만, 그 결과 백그라운드 실행이 전부
+    # `cmd & sleep 3; pidof ...` 같은 우회로 밀려났다. 구분자를 빼고 조립하면
+    # 문법도 맞고 프레임도 정상 완성된다. `&&` 는 여전히 미완성 명령이므로 거부.
+    background = bare.endswith("&") and not bare.endswith("&&")
+    if not background and bare.endswith(_TRAILING):
+        return "command ends with a shell operator", False
+    return _check_destructive(c, confirm), background
 
 
 # ---------------------------------------------------------------------------
@@ -268,12 +276,13 @@ def _busy(sess: Session) -> dict:
     r["hint"] = (
         "another command is running on this session, so this one has NOT started "
         "yet. This is not a failure: check progress with session_read, then retry "
-        "the same call."
+        "the same call. If you did not start anything, a background liveness probe "
+        "briefly held the session; retrying immediately will succeed."
     )
     return r
 
 
-def _ok(sess, body: bytes, rc, pos, truncated, capped, max_bytes) -> dict:
+def _ok(sess, body: bytes, rc, pos, truncated, capped, max_bytes, hint=None) -> dict:
     body, hit = _cap_body(body, max_bytes)
     r = _base(sess)
     r.update(
@@ -283,6 +292,7 @@ def _ok(sess, body: bytes, rc, pos, truncated, capped, max_bytes) -> dict:
         complete=True,
         truncated=truncated,
         capped=capped or hit,
+        hint=hint,  # 완료 경로에도 붙을 수 있다 — 백그라운드 실행 안내 (§5.1)
     )
     return r
 
@@ -308,14 +318,52 @@ def _incomplete(sess, frame, scanner, pos, truncated, capped, hint, max_bytes) -
 _INTERACTIVE = re.compile(r"\b(vim?|vi|nano|top|htop|less|more|man|su|ssh|ftp)\b")
 _STDIN_EATER = re.compile(r"^(cat|read|python3?|sh|bash|sort|wc|grep|head|tail)\s*$")
 
+# 이 시간 넘게 아무것도 못 받은 세션에서 명령이 타임아웃했다면 링크를 의심한다
+# (§4.10). manager 의 하트비트 주기와 독립적인 값이다 — 하트비트를 꺼도
+# (--heartbeat-sec 0) 이 판단은 남아야 한다.
+LIVENESS_SUSPECT = 120.0
 
-def _timeout_hint(cmd: str, scanner: _FrameScanner, truncated: bool) -> str:
+_BACKGROUND_HINT = (
+    "the job was backgrounded with `&`, so exit_code is null — the shell reports "
+    "only the launch, not the result. Its stdout still goes to this session and "
+    "will interleave with later output, so prefer `cmd >/tmp/log 2>&1 &` and read "
+    "the file. session_exec(\"echo $!\") returns its PID."
+)
+
+_HALF_OPEN_HINT = (
+    "this session is marked stale: it did not answer a liveness probe and has "
+    "received nothing for {idle}s, so the connection is probably half-open — the "
+    "local TCP socket is still ESTABLISHED while the remote end is gone. Do NOT "
+    "keep polling. Confirm with session_list (state, last_rx_sec); if it stays "
+    "stale, session_close it and wait for the target to call back."
+)
+
+_QUIET_HINT = (
+    "the shell never echoed the start marker and this session has received "
+    "nothing for {idle}s, so it may be wedged or the link may be half-open "
+    "rather than the command being slow. Check session_list (state, "
+    "last_rx_sec) before polling further."
+)
+
+
+def _timeout_hint(
+    sess: Session, cmd: str, scanner: _FrameScanner, truncated: bool
+) -> str:
     c = cmd.strip()
+    idle = int(time.time() - sess.last_rx)
     if truncated and scanner.s_at < 0:
         return (
             "output was too large and the start of the frame was lost. Reduce the "
             "output (`| head`) or redirect to a file and read it in pieces."
         )
+    # 링크 의심을 다른 힌트보다 먼저 본다. 죽은 세션에 "아직 실행 중일 수 있으니
+    # 계속 읽어보라"고 안내하면 호출자를 타임아웃 루프에 가둔다 — 실제로 겪은
+    # 실패 양상이 정확히 이것이었다 (§4.10).
+    if sess.state == "stale":
+        return _HALF_OPEN_HINT.format(idle=idle)
+    if scanner.s_at < 0 and idle >= LIVENESS_SUSPECT:
+        # 시작 마커조차 안 왔다 = 셸이 우리 payload 를 처리한 흔적이 없다.
+        return _QUIET_HINT.format(idle=idle)
     if _INTERACTIVE.search(c):
         return (
             "this looks like an interactive program, so the sentinel will never "
@@ -350,7 +398,8 @@ async def execute(
     max_bytes: int = DEFAULT_MAX_BYTES,
     confirm: bool = False,
 ) -> dict:
-    err = _validate_all(cmd, confirm)
+    """검증 + 락 획득 + 실행. session_exec 툴이 부르는 공개 진입점이다."""
+    err, background = _validate_all(cmd, confirm)
     if err:
         return _rejected(sess, err)
 
@@ -360,52 +409,79 @@ async def execute(
         return _busy(sess)
 
     async with sess.exec_lock:
-        token = secrets.token_hex(6)
-        s_mark = f"__S{token}__".encode()
-        e_mark = f"__E{token}__".encode()
-        # 마커 분할 트릭을 빼지 말 것: sh 는 인접 따옴표 문자열을 이어붙이지만
-        # PTY 에코로 되돌아오는 원문에는 따옴표가 살아있어 마커와 일치하지 않는다.
-        payload = (
-            f"printf '__S''{token}''__\\n'; {cmd.strip()}; "
-            f"printf '__E''{token}''__%d\\n' $?\n"
-        ).encode()
+        return await run_framed(sess, cmd, timeout, max_bytes, background)
 
-        pos = sess.buffer.end()  # 전송 직전 고정
-        frame = bytearray()
-        scanner = _FrameScanner(s_mark, e_mark)
-        truncated = capped = False
-        await sess.write(payload)
 
-        deadline = time.monotonic() + timeout
-        while True:
-            gen = sess.buffer.gen()  # 반드시 read '전' 에 잡는다
-            chunk, pos, trunc, read_capped = sess.buffer.read_since(pos, EXEC_READ_MAX)
-            truncated |= trunc
-            if chunk:
-                frame.extend(chunk)
+async def run_framed(
+    sess: Session,
+    cmd: str,
+    timeout: float = DEFAULT_TIMEOUT,
+    max_bytes: int = DEFAULT_MAX_BYTES,
+    background: bool = False,
+) -> dict:
+    """프레이밍 실행 코어. **호출자가 exec_lock 을 이미 잡고 있다고 가정한다.**
 
-            # ── 순서 엄수: feed 먼저, compact 나중 (§5.5) ──
-            done = scanner.feed(frame)
-            if done is not None:
-                body, rc = done
-                return _ok(sess, body, rc, pos, truncated, capped, max_bytes)
-            capped |= scanner.compact(frame, max_bytes)
+    execute 에서 분리한 이유는 manager 의 프로브들(PTY 판별 §4.8, liveness
+    하트비트 §4.10) 때문이다. 그쪽은 execute 를 부르면 락 경합 시 _busy 를
+    돌려받는데, 그 결과는 "세션이 무응답" 과 "다른 명령이 실행 중" 을 구분하지
+    못해 stale 오판으로 이어진다. 프로브가 락을 직접 잡고 이 함수를 부르면
+    그 모호함이 사라진다. 검증은 하지 않으므로 외부 입력을 이리로 보내지 말 것.
+    """
+    token = secrets.token_hex(6)
+    s_mark = f"__S{token}__".encode()
+    e_mark = f"__E{token}__".encode()
+    # `&` 로 끝나는 명령은 그 자체가 구분자라 `;` 를 붙이면 `& ;` = parse error 다.
+    # 구분자를 빼고 이어 붙인다 (§5.1).
+    sep = " " if background else "; "
+    # 마커 분할 트릭을 빼지 말 것: sh 는 인접 따옴표 문자열을 이어붙이지만
+    # PTY 에코로 되돌아오는 원문에는 따옴표가 살아있어 마커와 일치하지 않는다.
+    payload = (
+        f"printf '__S''{token}''__\\n'; {cmd.strip()}{sep}"
+        f"printf '__E''{token}''__%d\\n' $?\n"
+    ).encode()
 
-            if sess.state == "dead":
-                return _incomplete(
-                    sess, frame, scanner, pos, truncated, capped,
-                    "the session closed before the command finished", max_bytes,
-                )
-            if (remaining := deadline - time.monotonic()) <= 0:
-                break  # ← read_capped 분기보다 반드시 위 (§5.2-3)
-            if read_capped:
-                # 미읽은 데이터가 남았다. 대기 금지. 다만 이 경로 전체가 sync 라
-                # 양보하지 않으면 펌프가 굶는다.
-                await asyncio.sleep(0)
-                continue
-            await sess.buffer.wait_change(
-                gen, remaining, also=lambda: sess.state == "dead"
+    pos = sess.buffer.end()  # 전송 직전 고정
+    frame = bytearray()
+    scanner = _FrameScanner(s_mark, e_mark)
+    truncated = capped = False
+    await sess.write(payload)
+
+    deadline = time.monotonic() + timeout
+    while True:
+        gen = sess.buffer.gen()  # 반드시 read '전' 에 잡는다
+        chunk, pos, trunc, read_capped = sess.buffer.read_since(pos, EXEC_READ_MAX)
+        truncated |= trunc
+        if chunk:
+            frame.extend(chunk)
+
+        # ── 순서 엄수: feed 먼저, compact 나중 (§5.5) ──
+        done = scanner.feed(frame)
+        if done is not None:
+            body, rc = done
+            if background:
+                # POSIX 는 비동기 리스트의 종료 상태를 0 으로 정의한다. 즉 여기서
+                # 얻는 $? 는 '기동에 성공했다' 일 뿐 작업 결과가 아니다. 0 을 그대로
+                # 흘리면 성공으로 오독되므로 null 로 지운다.
+                rc = None
+            return _ok(
+                sess, body, rc, pos, truncated, capped, max_bytes,
+                _BACKGROUND_HINT if background else None,
             )
+        capped |= scanner.compact(frame, max_bytes)
+
+        if sess.state == "dead":
+            return _incomplete(
+                sess, frame, scanner, pos, truncated, capped,
+                "the session closed before the command finished", max_bytes,
+            )
+        if (remaining := deadline - time.monotonic()) <= 0:
+            break  # ← read_capped 분기보다 반드시 위 (§5.2-3)
+        if read_capped:
+            # 미읽은 데이터가 남았다. 대기 금지. 다만 이 경로 전체가 sync 라
+            # 양보하지 않으면 펌프가 굶는다.
+            await asyncio.sleep(0)
+            continue
+        await sess.buffer.wait_change(gen, remaining, also=lambda: sess.state == "dead")
 
     return _incomplete(
         sess,
@@ -414,7 +490,7 @@ async def execute(
         pos,
         truncated,
         capped,
-        _timeout_hint(cmd, scanner, truncated),
+        _timeout_hint(sess, cmd, scanner, truncated),
         max_bytes,
     )
 
@@ -436,6 +512,12 @@ async def session_write(
         warnings.append("wrote directly to a session with a session_exec in flight")
     if sess.state == "dead":
         warnings.append("session is dead; the bytes will not reach the target")
+    elif sess.state == "stale":
+        # 소켓이 열려 있어 write 자체는 성공한다. 성공했다고 도달한 것은 아니다.
+        warnings.append(
+            "session is stale (no response to a liveness probe); the socket still "
+            "accepts bytes but they may not reach the target"
+        )
     raw = data.encode() + (b"\n" if newline else b"")
     n = await sess.write(raw)
     if sess.write_stalled:
